@@ -36,6 +36,8 @@ jobs:
         FROM alpine:3.19 AS builder
         
         # Install build dependencies
+        # Note: lzo-static package doesn't exist in Alpine 3.19
+        # Static libraries are included in lzo-dev
         RUN apk add --no-cache \
             build-base \
             bsd-compat-headers \
@@ -46,7 +48,6 @@ jobs:
             libarchive-static \
             linux-headers \
             lzo-dev \
-            lzo-static \
             make \
             musl-dev \
             python3-dev \
@@ -63,6 +64,7 @@ jobs:
         WORKDIR /usr/src/proot
         
         # Build static binary
+        # Note: lzo static lib is in /usr/lib/liblzo2.a from lzo-dev
         RUN export LDFLAGS="-static -ltalloc -larchive -llzo2 -lz" && \
             make -C src clean && \
             make -C src loader.elf build.h && \
@@ -157,7 +159,7 @@ jobs:
         RUN apk add --no-cache \
             build-base bsd-compat-headers clang gcc git \
             libarchive-dev libarchive-static linux-headers \
-            lzo-dev lzo-static make musl-dev python3-dev \
+            lzo-dev make musl-dev python3-dev \
             swig talloc-dev talloc-static uthash-dev zlib-static
         
         RUN git clone --depth 1 --branch v5.4.0 \
@@ -204,6 +206,9 @@ jobs:
     - name: Checkout Repository
       uses: actions/checkout@v4
 
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
     - name: Build PRoot v5.4.0 Static Binary (x86_64)
       run: |
         cat > Dockerfile.build << 'EOF'
@@ -212,7 +217,7 @@ jobs:
         RUN apk add --no-cache \
             build-base bsd-compat-headers clang gcc git \
             libarchive-dev libarchive-static linux-headers \
-            lzo-dev lzo-static make musl-dev python3-dev \
+            lzo-dev make musl-dev python3-dev \
             swig talloc-dev talloc-static uthash-dev zlib-static
         
         RUN git clone --depth 1 --branch v5.4.0 \
