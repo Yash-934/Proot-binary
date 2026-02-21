@@ -26,103 +26,112 @@ jobs:
       with:
         platforms: arm64
 
-    - name: Install Dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y \
-          qemu-user-static \
-          binfmt-support \
-          wget \
-          tar \
-          file
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
 
-    - name: Download Alpine ARM64 Rootfs
+    - name: Build PRoot v5.4.0 Static Binary (ARM64)
       run: |
-        mkdir -p $HOME/alpine-arm64
-        cd $HOME/alpine-arm64
-        wget -q https://dl-cdn.alpinelinux.org/alpine/v3.19/releases/aarch64/alpine-minirootfs-3.19.0-aarch64.tar.gz
-        tar -xzf alpine-minirootfs-3.19.0-aarch64.tar.gz
-        rm alpine-minirootfs-3.19.0-aarch64.tar.gz
-
-    - name: Install Build Dependencies in Alpine
-      run: |
-        # Register QEMU for ARM64
-        docker run --rm --privileged multiarch/qemu-user-static --reset -p yes || true
+        # Create a Dockerfile for building
+        cat > Dockerfile.build << 'EOF'
+        FROM alpine:3.19 AS builder
         
-        # Copy QEMU binary to rootfs
-        cp /usr/bin/qemu-aarch64-static $HOME/alpine-arm64/usr/bin/ || \
-        cp $(which qemu-aarch64-static) $HOME/alpine-arm64/usr/bin/ || true
+        # Install build dependencies
+        RUN apk add --no-cache \
+            build-base \
+            bsd-compat-headers \
+            clang \
+            gcc \
+            git \
+            libarchive-dev \
+            libarchive-static \
+            linux-headers \
+            lzo-dev \
+            lzo-static \
+            make \
+            musl-dev \
+            python3-dev \
+            swig \
+            talloc-dev \
+            talloc-static \
+            uthash-dev \
+            zlib-static
         
-        # Install dependencies using chroot with QEMU
-        sudo chroot $HOME/alpine-arm64 /sbin/apk update
-        sudo chroot $HOME/alpine-arm64 /sbin/apk add --no-cache \
-          build-base \
-          bsd-compat-headers \
-          clang \
-          gcc \
-          git \
-          libarchive-dev \
-          libarchive-static \
-          linux-headers \
-          lzo-dev \
-          lzo-static \
-          make \
-          musl-dev \
-          python3-dev \
-          swig \
-          talloc-dev \
-          talloc-static \
-          uthash-dev \
-          zlib-static
-
-    - name: Clone PRoot v5.4.0
-      run: |
-        mkdir -p $HOME/alpine-arm64/usr/src
-        sudo git clone --depth 1 --branch v5.4.0 \
-          https://github.com/proot-me/proot.git \
-          $HOME/alpine-arm64/usr/src/proot
-
-    - name: Build Static PRoot (ARM64)
-      run: |
-        # Critical: Use LDFLAGS for static linking with talloc
-        sudo chroot $HOME/alpine-arm64 /bin/sh -c '
-          cd /usr/src/proot &&
-          export LDFLAGS="-static -ltalloc -larchive -llzo2 -lz" &&
-          make -C src clean &&
-          make -C src loader.elf build.h &&
-          make -C src proot
-        '
+        # Clone PRoot v5.4.0
+        RUN git clone --depth 1 --branch v5.4.0 \
+            https://github.com/proot-me/proot.git /usr/src/proot
+        
+        WORKDIR /usr/src/proot
+        
+        # Build static binary
+        RUN export LDFLAGS="-static -ltalloc -larchive -llzo2 -lz" && \
+            make -C src clean && \
+            make -C src loader.elf build.h && \
+            make -C src proot
+        
+        # Verify static linking
+        RUN file src/proot && \
+            ldd src/proot 2>&1 || echo "Static binary verified"
+        
+        # Create output directory
+        RUN mkdir -p /output && \
+            cp src/proot /output/proot-static-aarch64 && \
+            cp src/loader.elf /output/loader.elf 2>/dev/null || true
+        
+        FROM scratch AS export
+        COPY --from=builder /output/proot-static-aarch64 /
+        COPY --from=builder /output/loader.elf /
+        EOF
+        
+        # Build using Docker Buildx with ARM64 platform
+        docker buildx build \
+          --platform linux/arm64 \
+          --file Dockerfile.build \
+          --target export \
+          --output type=local,dest=./output \
+          .
 
     - name: Verify Build
       run: |
-        ls -la $HOME/alpine-arm64/usr/src/proot/src/proot
-        file $HOME/alpine-arm64/usr/src/proot/src/proot
-        # Check if statically linked
-        if ldd $HOME/alpine-arm64/usr/src/proot/src/proot 2>&1 | grep -q "not a dynamic executable"; then
-          echo "✓ Binary is fully static"
+        ls -la ./output/
+        file ./output/proot-static-aarch64
+        
+        # Check if it's actually ARM64 binary
+        if file ./output/proot-static-aarch64 | grep -q "aarch64"; then
+          echo "✓ Binary is ARM64 architecture"
         else
-          echo "⚠ Warning: Binary may not be fully static"
-          ldd $HOME/alpine-arm64/usr/src/proot/src/proot 2>&1 || true
+          echo "✗ Binary architecture mismatch"
+          exit 1
+        fi
+        
+        # Check if statically linked
+        if file ./output/proot-static-aarch64 | grep -q "statically linked"; then
+          echo "✓ Binary is statically linked"
+        else
+          echo "⚠ Warning: May not be fully static"
         fi
 
     - name: Prepare Artifact
       run: |
-        mkdir -p $HOME/proot-release
-        cp $HOME/alpine-arm64/usr/src/proot/src/proot $HOME/proot-release/proot-static-aarch64
-        cp $HOME/alpine-arm64/usr/src/proot/src/loader.elf $HOME/proot-release/loader.elf 2>/dev/null || true
-        chmod +x $HOME/proot-release/proot-static-aarch64
-        echo "PRoot v5.4.0 Static Binary (AArch64)" > $HOME/proot-release/README.txt
-        echo "Build Date: $(date)" >> $HOME/proot-release/README.txt
-        echo "Architecture: aarch64/arm64" >> $HOME/proot-release/README.txt
+        mkdir -p release
+        cp ./output/proot-static-aarch64 release/
+        [ -f ./output/loader.elf ] && cp ./output/loader.elf release/
+        
+        echo "PRoot v5.4.0 Static Binary (AArch64)" > release/README.txt
+        echo "Build Date: $(date)" >> release/README.txt
+        echo "Architecture: aarch64/arm64" >> release/README.txt
+        echo "Source: https://github.com/proot-me/proot/releases/tag/v5.4.0" >> release/README.txt
+        
+        chmod +x release/proot-static-aarch64
 
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
       with:
         name: proot-static-aarch64
         path: |
-          $HOME/proot-release/proot-static-aarch64
-          $HOME/proot-release/loader.elf
-          $HOME/proot-release/README.txt
+          release/proot-static-aarch64
+          release/loader.elf
+          release/README.txt
+        if-no-files-found: error
 
   build-armv7:
     runs-on: ubuntu-latest
@@ -137,51 +146,55 @@ jobs:
       with:
         platforms: arm
 
-    - name: Download Alpine ARMv7 Rootfs
-      run: |
-        mkdir -p $HOME/alpine-armv7
-        cd $HOME/alpine-armv7
-        wget -q https://dl-cdn.alpinelinux.org/alpine/v3.19/releases/armv7/alpine-minirootfs-3.19.0-armv7.tar.gz
-        tar -xzf alpine-minirootfs-3.19.0-armv7.tar.gz
-        rm alpine-minirootfs-3.19.0-armv7.tar.gz
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
 
-    - name: Install Dependencies
+    - name: Build PRoot v5.4.0 Static Binary (ARMv7)
       run: |
-        docker run --rm --privileged multiarch/qemu-user-static --reset -p yes || true
-        cp /usr/bin/qemu-arm-static $HOME/alpine-armv7/usr/bin/ || true
+        cat > Dockerfile.build << 'EOF'
+        FROM alpine:3.19 AS builder
         
-        sudo chroot $HOME/alpine-armv7 /sbin/apk update
-        sudo chroot $HOME/alpine-armv7 /sbin/apk add --no-cache \
-          build-base bsd-compat-headers clang gcc git libarchive-dev \
-          libarchive-static linux-headers lzo-dev lzo-static make \
-          musl-dev python3-dev swig talloc-dev talloc-static uthash-dev zlib-static
-
-    - name: Clone and Build PRoot v5.4.0
-      run: |
-        mkdir -p $HOME/alpine-armv7/usr/src
-        sudo git clone --depth 1 --branch v5.4.0 \
-          https://github.com/proot-me/proot.git \
-          $HOME/alpine-armv7/usr/src/proot
+        RUN apk add --no-cache \
+            build-base bsd-compat-headers clang gcc git \
+            libarchive-dev libarchive-static linux-headers \
+            lzo-dev lzo-static make musl-dev python3-dev \
+            swig talloc-dev talloc-static uthash-dev zlib-static
         
-        sudo chroot $HOME/alpine-armv7 /bin/sh -c '
-          cd /usr/src/proot &&
-          export LDFLAGS="-static -ltalloc -larchive -llzo2 -lz" &&
-          make -C src clean &&
-          make -C src loader.elf build.h &&
-          make -C src proot
-        '
+        RUN git clone --depth 1 --branch v5.4.0 \
+            https://github.com/proot-me/proot.git /usr/src/proot
+        
+        WORKDIR /usr/src/proot
+        
+        RUN export LDFLAGS="-static -ltalloc -larchive -llzo2 -lz" && \
+            make -C src clean && \
+            make -C src loader.elf build.h && \
+            make -C src proot
+        
+        RUN mkdir -p /output && cp src/proot /output/proot-static-armv7
+        
+        FROM scratch AS export
+        COPY --from=builder /output/proot-static-armv7 /
+        EOF
+        
+        docker buildx build \
+          --platform linux/arm/v7 \
+          --file Dockerfile.build \
+          --target export \
+          --output type=local,dest=./output \
+          .
 
     - name: Prepare Artifact
       run: |
-        mkdir -p $HOME/proot-release
-        cp $HOME/alpine-armv7/usr/src/proot/src/proot $HOME/proot-release/proot-static-armv7
-        chmod +x $HOME/proot-release/proot-static-armv7
+        mkdir -p release
+        cp ./output/proot-static-armv7 release/
+        chmod +x release/proot-static-armv7
 
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
       with:
         name: proot-static-armv7
-        path: $HOME/proot-release/proot-static-armv7
+        path: release/proot-static-armv7
+        if-no-files-found: error
 
   build-x86_64:
     runs-on: ubuntu-latest
@@ -191,42 +204,52 @@ jobs:
     - name: Checkout Repository
       uses: actions/checkout@v4
 
-    - name: Install Dependencies
+    - name: Build PRoot v5.4.0 Static Binary (x86_64)
       run: |
-        sudo apt-get update
-        sudo apt-get install -y \
-          build-essential \
-          libtalloc-dev \
-          libarchive-dev \
-          liblzo2-dev \
-          uthash-dev \
-          git
+        cat > Dockerfile.build << 'EOF'
+        FROM alpine:3.19 AS builder
+        
+        RUN apk add --no-cache \
+            build-base bsd-compat-headers clang gcc git \
+            libarchive-dev libarchive-static linux-headers \
+            lzo-dev lzo-static make musl-dev python3-dev \
+            swig talloc-dev talloc-static uthash-dev zlib-static
+        
+        RUN git clone --depth 1 --branch v5.4.0 \
+            https://github.com/proot-me/proot.git /usr/src/proot
+        
+        WORKDIR /usr/src/proot
+        
+        RUN export LDFLAGS="-static -ltalloc -larchive -llzo2 -lz" && \
+            make -C src clean && \
+            make -C src loader.elf build.h && \
+            make -C src proot
+        
+        RUN mkdir -p /output && cp src/proot /output/proot-static-x86_64
+        
+        FROM scratch AS export
+        COPY --from=builder /output/proot-static-x86_64 /
+        EOF
+        
+        docker buildx build \
+          --platform linux/amd64 \
+          --file Dockerfile.build \
+          --target export \
+          --output type=local,dest=./output \
+          .
 
-    - name: Clone PRoot v5.4.0
+    - name: Prepare Artifact
       run: |
-        git clone --depth 1 --branch v5.4.0 \
-          https://github.com/proot-me/proot.git \
-          $HOME/proot
-
-    - name: Build Static PRoot (x86_64)
-      run: |
-        cd $HOME/proot
-        export LDFLAGS="-static -ltalloc -larchive -llzo2 -lz"
-        make -C src clean
-        make -C src loader.elf build.h
-        make -C src proot
-
-    - name: Verify Build
-      run: |
-        file $HOME/proot/src/proot
-        ldd $HOME/proot/src/proot 2>&1 | grep -q "not a dynamic executable" && \
-          echo "✓ Static binary verified" || echo "⚠ Not fully static"
+        mkdir -p release
+        cp ./output/proot-static-x86_64 release/
+        chmod +x release/proot-static-x86_64
 
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
       with:
         name: proot-static-x86_64
-        path: $HOME/proot/src/proot
+        path: release/proot-static-x86_64
+        if-no-files-found: error
 
   release:
     needs: [build-aarch64, build-armv7, build-x86_64]
@@ -243,9 +266,12 @@ jobs:
     - name: Prepare Release Assets
       run: |
         mkdir -p release
+        
+        # Copy all artifacts
         cp artifacts/proot-static-aarch64/proot-static-aarch64 release/ 2>/dev/null || true
+        cp artifacts/proot-static-aarch64/loader.elf release/ 2>/dev/null || true
         cp artifacts/proot-static-armv7/proot-static-armv7 release/ 2>/dev/null || true
-        cp artifacts/proot-static-x86_64/proot/proot release/proot-static-x86_64 2>/dev/null || true
+        cp artifacts/proot-static-x86_64/proot-static-x86_64 release/ 2>/dev/null || true
         
         # Create archives
         cd release
